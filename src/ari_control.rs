@@ -62,7 +62,7 @@ impl AriController {
         app: &str,
     ) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
     {
-        let mut ws_url = self.base_url.clone();
+        let mut ws_url = self.path_url("/events")?;
         let scheme = match ws_url.scheme() {
             "http" => "ws",
             "https" => "wss",
@@ -71,7 +71,6 @@ impl AriController {
         ws_url
             .set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
-        ws_url.set_path("/ari/events");
         ws_url
             .query_pairs_mut()
             .clear()
@@ -240,7 +239,7 @@ impl AriController {
     }
 
     fn media_websocket_url(&self, connection_id: &str) -> Result<String> {
-        let mut ws_url = self.base_url.clone();
+        let mut ws_url = self.path_url(&format!("/media/{connection_id}"))?;
         let scheme = match ws_url.scheme() {
             "http" => "ws",
             "https" => "wss",
@@ -249,7 +248,6 @@ impl AriController {
         ws_url
             .set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
-        ws_url.set_path(&format!("/media/{connection_id}"));
         ws_url.set_query(None);
         Ok(ws_url.to_string())
     }

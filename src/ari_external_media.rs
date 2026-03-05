@@ -103,7 +103,9 @@ impl ExternalMediaRequest {
 
         let connection_type =
             std::env::var("ARI_MEDIA_CONNECTION_TYPE").unwrap_or_else(|_| "server".to_string());
-        let transport_data = std::env::var("ARI_MEDIA_TRANSPORT_DATA").ok();
+        let transport_data = std::env::var("ARI_MEDIA_TRANSPORT_DATA")
+            .ok()
+            .or_else(|| Some("f(json)".to_string()));
         let direction = std::env::var("ARI_MEDIA_DIRECTION").unwrap_or_else(|_| "both".to_string());
         let data = std::env::var("ARI_MEDIA_DATA").unwrap_or_else(|_| "slmodem".to_string());
 
