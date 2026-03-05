@@ -14,7 +14,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let mut session = Session::new(cfg.dial_string.clone());
     session.transition(SessionState::Originating)?;
 
-    let mut sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
+    let sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
     let ari = AriController::from_config(&cfg)?;
 
     // --- CRITICAL SYNC POINT ---
@@ -37,7 +37,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     // Read the dial string from the socket.
     // If started by ATZ, this will be empty. We will then wait for the real
     // dial string from the ATDT command.
-    let mut dial_string = cfg.dial_string.clone();
+    let mut dial_string;
     let mut line = String::new();
     let mut reader = tokio::io::BufReader::new(sl_stream);
     
