@@ -27,7 +27,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     // We write a single newline to the Unix socket. slmodemd will be
     // blocking on a read until this arrives.
     sl_stream.writable().await?;
-    sl_stream.try_write(b"\n")?;
+    sl_stream.write_all(b"\n").await?;
     info!("event=sent_ready_to_slmodemd");
 
     // Give Asterisk a moment to register the Stasis app before we start
@@ -35,25 +35,41 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Read the dial string from the socket.
-    // If started by ATZ, this will be empty. We will then wait for the real
-    // dial string from the ATDT command.
-    let mut dial_string;
-    let mut line = String::new();
-    let mut reader = tokio::io::BufReader::new(sl_stream);
-    
-    // Read first dial string (from startup)
-    reader.read_line(&mut line).await?;
-    dial_string = line.trim().to_string();
-    
-    while dial_string.is_empty() {
-        info!("event=waiting_for_dial_string");
-        line.clear();
-        reader.read_line(&mut line).await?;
-        dial_string = line.trim().to_string();
+    // If started by slmodemd at boot, this will initially be empty.
+    // We send silence samples while waiting to keep slmodemd's DSP clock running.
+    let (read_half, mut write_half) = sl_stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut dial_string = String::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
+    let silence = [0u8; 384]; // 192 samples * 2 bytes (S16_LE) for 9600Hz
+
+    info!("event=waiting_for_dial_string");
+    loop {
+        let mut line = String::new();
+        tokio::select! {
+            res = reader.read_line(&mut line) => {
+                match res {
+                    Ok(_) => {
+                        let s = line.trim().to_string();
+                        if !s.is_empty() {
+                            dial_string = s;
+                            break;
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            _ = interval.tick() => {
+                // Keep slmodemd DSP alive by providing a clock
+                write_half.write_all(&silence).await?;
+            }
+        }
     }
+
     info!(dial = %dial_string, "event=received_dial_string");
     session = Session::new(dial_string.clone());
-    let sl_stream = reader.into_inner();
+    let sl_stream = reader.into_inner().reunite(write_half)
+        .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
 
     // Create the media channel and obtain its WebSocket URL first.
     let media_setup = ari.setup_media(&media_request).await?;
