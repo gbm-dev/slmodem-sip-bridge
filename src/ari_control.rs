@@ -75,8 +75,18 @@ impl AriController {
         let auth_header =
             format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &auth));
 
+        let host = ws_url
+            .host_str()
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        let host_header = match ws_url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+
         let request = tungstenite::http::Request::builder()
             .uri(ws_url.as_str())
+            .header("Host", &host_header)
             .header("Authorization", &auth_header)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
