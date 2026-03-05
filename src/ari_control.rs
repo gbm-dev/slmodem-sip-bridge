@@ -5,7 +5,8 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
-use tracing::warn;
+use tokio_tungstenite::tungstenite;
+use tracing::{debug, warn};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,55 @@ impl AriController {
             dial_endpoint_template: cfg.ari_dial_endpoint_template.clone(),
             originate_timeout: cfg.originate_timeout,
         })
+    }
+
+    /// Open the ARI events WebSocket, which registers the Stasis app with
+    /// Asterisk. The returned stream must be kept alive for the duration of
+    /// the call — dropping it unregisters the app.
+    pub async fn connect_events(
+        &self,
+        app: &str,
+    ) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
+    {
+        let mut ws_url = self.base_url.clone();
+        let scheme = match ws_url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            s => bail!("unsupported ARI URL scheme for events websocket: {s}"),
+        };
+        ws_url
+            .set_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
+        ws_url.set_path("/ari/events");
+        ws_url
+            .query_pairs_mut()
+            .clear()
+            .append_pair("app", app)
+            .append_pair("subscribeAll", "true");
+
+        let auth = format!("{}:{}", self.username, self.password);
+        let auth_header =
+            format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &auth));
+
+        let request = tungstenite::http::Request::builder()
+            .uri(ws_url.as_str())
+            .header("Authorization", &auth_header)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .context("failed to build ARI events websocket request")?;
+
+        let (stream, _resp) = tokio_tungstenite::connect_async(request)
+            .await
+            .context("failed to connect ARI events websocket")?;
+
+        debug!(app, url = %ws_url, "event=ari_events_connected");
+        Ok(stream)
     }
 
     pub async fn start_call(

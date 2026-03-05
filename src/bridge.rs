@@ -17,6 +17,11 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
 
     let sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
     let ari = AriController::from_config(&cfg)?;
+
+    // Register the Stasis app by opening the ARI events WebSocket.
+    // This must stay open for the lifetime of the call.
+    let _ari_events = ari.connect_events(&media_request.app).await?;
+
     let call = ari.start_call(&cfg.dial_string, &media_request).await?;
     session.transition(SessionState::ConnectingMedia)?;
 
