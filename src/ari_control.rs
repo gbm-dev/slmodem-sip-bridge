@@ -1,3 +1,4 @@
+use base64::Engine;
 use crate::ari_external_media::{Encapsulation, ExternalMediaRequest, Transport};
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
