@@ -1,0 +1,38 @@
+name: Build and Release Bridge
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/slmodem-asterisk-bridge dist/slmodem-asterisk-bridge-linux-x86_64
+          sha256sum dist/slmodem-asterisk-bridge-linux-x86_64 > dist/sha256sums.txt
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/slmodem-asterisk-bridge-linux-x86_64
+            dist/sha256sums.txt
+          generate_release_notes: true
