@@ -6,8 +6,7 @@ use crate::slmodem::socket_from_raw_fd;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, instrument};
 
 #[instrument(skip_all, fields(dial = %cfg.dial_string, media = %cfg.media_addr, fd = cfg.socket_fd))]
@@ -28,27 +27,11 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let media_setup = ari.setup_media(&media_request).await?;
     session.transition(SessionState::ConnectingMedia)?;
 
-    // Connect the media WebSocket before dialing so the media path is
-    // ready when audio starts flowing.
-    let (media_ws, _) = timeout(
-        cfg.connect_timeout,
-        connect_async(&media_setup.media_websocket_url),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "timed out connecting to media websocket {}",
-            media_setup.media_websocket_url
-        )
-    })?
-    .with_context(|| {
-        format!(
-            "failed connecting to media websocket {}",
-            media_setup.media_websocket_url
-        )
-    })?;
-
-    info!(url = %media_setup.media_websocket_url, "event=media_ws_connected");
+    // Connect the media WebSocket (with auth) before dialing so the
+    // media path is ready when audio starts flowing.
+    let media_ws = ari
+        .connect_media_websocket(&media_setup.media_websocket_url, cfg.connect_timeout)
+        .await?;
 
     // Now dial the outbound call and bridge the channels.
     let call = match ari

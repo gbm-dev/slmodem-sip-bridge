@@ -77,32 +77,7 @@ impl AriController {
             .append_pair("app", app)
             .append_pair("subscribeAll", "true");
 
-        let auth = format!("{}:{}", self.username, self.password);
-        let auth_header =
-            format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &auth));
-
-        let host = ws_url
-            .host_str()
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        let host_header = match ws_url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host,
-        };
-
-        let request = tungstenite::http::Request::builder()
-            .uri(ws_url.as_str())
-            .header("Host", &host_header)
-            .header("Authorization", &auth_header)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .context("failed to build ARI events websocket request")?;
+        let request = self.authenticated_ws_request(ws_url.as_str())?;
 
         let (stream, _resp) = tokio_tungstenite::connect_async(request)
             .await
@@ -250,6 +225,65 @@ impl AriController {
             .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
         ws_url.set_query(None);
         Ok(ws_url.to_string())
+    }
+
+    /// Build an authenticated WebSocket request for the given URL.
+    fn authenticated_ws_request(
+        &self,
+        url: &str,
+    ) -> Result<tungstenite::http::Request<()>> {
+        let parsed = Url::parse(url)
+            .with_context(|| format!("invalid websocket URL: {url}"))?;
+
+        let auth = format!("{}:{}", self.username, self.password);
+        let auth_header = format!(
+            "Basic {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &auth)
+        );
+
+        let host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
+        let host_header = match parsed.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+
+        tungstenite::http::Request::builder()
+            .uri(url)
+            .header("Host", &host_header)
+            .header("Authorization", &auth_header)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .with_context(|| format!("failed to build websocket request for {url}"))
+    }
+
+    /// Connect to the media WebSocket with authentication.
+    pub async fn connect_media_websocket(
+        &self,
+        url: &str,
+        connect_timeout: Duration,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let request = self.authenticated_ws_request(url)?;
+
+        let (stream, _resp) = tokio::time::timeout(
+            connect_timeout,
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .with_context(|| format!("timed out connecting to media websocket {url}"))?
+        .with_context(|| format!("failed connecting to media websocket {url}"))?;
+
+        debug!(url, "event=media_ws_connected");
+        Ok(stream)
     }
 
     async fn create_bridge(&self, bridge_id: &str) -> Result<()> {
@@ -550,6 +584,6 @@ mod tests {
     fn builds_media_websocket_url_from_ari_base() {
         let ctl = AriController::from_config(&cfg()).unwrap();
         let url = ctl.media_websocket_url("media-conn-1").unwrap();
-        assert_eq!(url, "ws://127.0.0.1:8088/media/media-conn-1");
+        assert_eq!(url, "ws://127.0.0.1:8088/ari/media/media-conn-1");
     }
 }
