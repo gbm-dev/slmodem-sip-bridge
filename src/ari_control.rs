@@ -28,8 +28,14 @@ pub struct AriController {
 
 impl AriController {
     pub fn from_config(cfg: &Config) -> Result<Self> {
-        let base_url = Url::parse(&cfg.ari_base_url)
-            .with_context(|| format!("invalid ARI URL {}", cfg.ari_base_url))?;
+        // Url::join replaces the last path segment unless the base ends with '/'.
+        // Ensure trailing slash so "/ari" + "bridges" = "/ari/bridges", not "/bridges".
+        let mut base = cfg.ari_base_url.clone();
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        let base_url =
+            Url::parse(&base).with_context(|| format!("invalid ARI URL {}", cfg.ari_base_url))?;
         Ok(Self {
             client: reqwest::Client::new(),
             base_url,
@@ -436,6 +442,13 @@ mod tests {
             ctl.endpoint_from_dial("18005551212"),
             "PJSIP/18005551212@telnyx-out"
         );
+    }
+
+    #[test]
+    fn path_url_preserves_ari_prefix() {
+        let ctl = AriController::from_config(&cfg()).unwrap();
+        let url = ctl.path_url("/bridges").unwrap();
+        assert_eq!(url.path(), "/ari/bridges");
     }
 
     #[test]
