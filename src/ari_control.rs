@@ -74,24 +74,30 @@ impl AriController {
             .set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
 
-        // Add credentials directly to the URL for Basic Auth.
-        // tungstenite uses this to generate the Authorization header automatically.
-        ws_url.set_username(&self.username).map_err(|_| {
-            anyhow::anyhow!("failed to set username in websocket URL")
-        })?;
-        ws_url.set_password(Some(&self.password)).map_err(|_| {
-            anyhow::anyhow!("failed to set password in websocket URL")
-        })?;
-
         ws_url
             .query_pairs_mut()
             .clear()
             .append_pair("app", app);
 
+        // Build request with explicit Basic Auth header
+        let auth = format!("{}:{}", self.username, self.password);
+        let auth_base64 = base64::engine::general_purpose::STANDARD.encode(auth);
+        let auth_header = format!("Basic {auth_base64}");
+
+        let request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
+            .uri(ws_url.as_str())
+            .header("Authorization", auth_header)
+            .header("Host", ws_url.host_str().unwrap_or("localhost"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+            .header("Sec-WebSocket-Version", "13")
+            .body(())?;
+
         let max_retries = 5;
         let mut attempt = 0;
         loop {
-            match tokio_tungstenite::connect_async(ws_url.as_str()).await {
+            match tokio_tungstenite::connect_async(request.clone()).await {
                 Ok((stream, _resp)) => {
                     debug!(app, url = %ws_url, "event=ari_events_connected");
                     return Ok(stream);
