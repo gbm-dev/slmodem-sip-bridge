@@ -5,7 +5,7 @@ use crate::session::{Session, SessionState};
 use crate::slmodem::socket_from_raw_fd;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, instrument};
 
