@@ -322,6 +322,21 @@ impl SipClient {
                 None => continue,
             };
 
+            // Filter by CSeq to ignore retransmitted responses from previous
+            // transactions (e.g. a stale 407 from the first INVITE arriving
+            // after we've already sent an authenticated re-INVITE with CSeq+1).
+            if let Some(resp_cseq) = extract_cseq_num(&resp) {
+                if resp_cseq != call.cseq {
+                    debug!(
+                        resp_cseq,
+                        expected_cseq = call.cseq,
+                        status,
+                        "event=ignoring_stale_response, reason=CSeq mismatch"
+                    );
+                    continue;
+                }
+            }
+
             // Extract remote tag from To header if present
             if call.remote_tag.is_none() {
                 if let Some(to) = extract_header(&resp, "To") {
@@ -680,6 +695,14 @@ fn extract_header<'a>(msg: &'a str, name: &str) -> Option<String> {
     None
 }
 
+/// Extract the numeric CSeq value from a SIP response.
+/// CSeq header format: "CSeq: 1 INVITE"
+fn extract_cseq_num(msg: &str) -> Option<u32> {
+    let cseq_value = extract_header(msg, "CSeq")?;
+    let num_str = cseq_value.split_whitespace().next()?;
+    num_str.parse().ok()
+}
+
 fn extract_quoted_param(header: &str, param: &str) -> Option<String> {
     let search = format!("{param}=\"");
     let start = header.find(&search)? + search.len();
@@ -831,6 +854,17 @@ mod tests {
         let val = extract_header(msg, "WWW-Authenticate");
         assert!(val.is_some());
         assert!(val.unwrap().contains("Digest"));
+    }
+
+    #[test]
+    fn extract_cseq_num_from_response() {
+        let msg = "SIP/2.0 407 Proxy Authentication Required\r\n\
+                   CSeq: 1 INVITE\r\n\r\n";
+        assert_eq!(extract_cseq_num(msg), Some(1));
+
+        let msg2 = "SIP/2.0 200 OK\r\n\
+                    CSeq: 2 INVITE\r\n\r\n";
+        assert_eq!(extract_cseq_num(msg2), Some(2));
     }
 
     #[test]
