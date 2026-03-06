@@ -25,14 +25,14 @@ jobs:
       - name: Package artifacts
         run: |
           mkdir -p dist
-          cp target/release/slmodem-asterisk-bridge dist/slmodem-asterisk-bridge-linux-x86_64
-          sha256sum dist/slmodem-asterisk-bridge-linux-x86_64 > dist/sha256sums.txt
+          cp target/release/slmodem-sip-bridge dist/slmodem-sip-bridge-linux-x86_64
+          sha256sum dist/slmodem-sip-bridge-linux-x86_64 > dist/sha256sums.txt
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/slmodem-asterisk-bridge-linux-x86_64
+            dist/slmodem-sip-bridge-linux-x86_64
             dist/sha256sums.txt
           generate_release_notes: true

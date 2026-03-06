@@ -1,10 +1,9 @@
 //! G.711 µ-law ↔ signed 16-bit linear PCM conversion.
 //!
-//! Modem training requires the cleanest possible audio path. By converting
-//! slin↔ulaw in the bridge (instead of letting Asterisk transcode), the
-//! Asterisk bridge can use `proxy_media` mode — a true passthrough with no
-//! mixing, resampling, or re-timing. This eliminates an entire processing
-//! stage from the audio path.
+//! Modem training requires the cleanest possible audio path. Converting
+//! slin↔ulaw in the bridge gives direct codec control — no transcoding
+//! middleman, no resampling, no re-timing. The bridge sends PCMU directly
+//! over RTP to the SIP trunk.
 //!
 //! Algorithm: ITU-T G.711 (1988), public domain reference implementation
 //! by Craig Reese (IDA/Supercomputing Research Center) and Joe Campbell

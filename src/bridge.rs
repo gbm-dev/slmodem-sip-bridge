@@ -1,14 +1,13 @@
-use crate::ari_control::AriController;
-use crate::ari_external_media::ExternalMediaRequest;
 use crate::codec;
 use crate::config::Config;
 use crate::dial_string::DialString;
+use crate::rtp;
+use crate::sdp;
 use crate::session::{Session, SessionState};
+use crate::sip::{CallState, SipClient};
 use crate::slmodem::socket_from_raw_fd;
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::Message;
+use std::net::SocketAddr;
 use tracing::{debug, error, info, warn};
 
 /// Maximum bytes a single line from slmodemd can be before we discard it.
@@ -39,42 +38,75 @@ const SILENCE_INTERVAL_MS: u64 = 20;
 /// to diagnose audio flow problems without flooding logs.
 const RELAY_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Safety limit on drain iterations during ARI setup. At 20 ms silence
-/// intervals, 500 iterations = 10 seconds — well beyond any ARI setup
+/// Safety limit on drain iterations during SIP setup. At 20 ms silence
+/// intervals, 500 iterations = 10 seconds — well beyond any SIP setup
 /// sequence. If we're still draining after this, something is stuck.
 const DRAIN_ITERATIONS_LIMIT: u32 = 500;
 
+/// SSRC for our RTP stream. Fixed value is fine — we're the only sender
+/// on this RTP session, no SSRC collision possible.
+const RTP_SSRC: u32 = 0x534C4D44; // "SLMD" in ASCII
+
 #[allow(clippy::too_many_lines)]
-pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()> {
+pub async fn run(cfg: Config) -> Result<()> {
     assert!(
         cfg.socket_fd >= 0,
         "socket fd must be non-negative, got {}",
         cfg.socket_fd
     );
     assert!(
-        !cfg.ari_base_url.is_empty(),
-        "ARI base URL must not be empty"
+        !cfg.telnyx_sip_user.is_empty(),
+        "TELNYX_SIP_USER must not be empty"
     );
 
     info!(
         fd = cfg.socket_fd,
-        ari_base_url = %cfg.ari_base_url,
+        sip_domain = %cfg.telnyx_sip_domain,
         "event=bridge_run_start"
     );
 
     let sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
-    let ari = AriController::from_config(&cfg)?;
 
-    // Register the Stasis app by opening the ARI events WebSocket once.
-    // Signal readiness to slmodemd only after this succeeds.
-    info!("event=connecting_ari_events, reason=must register stasis app before signaling readiness");
-    let ari_events = ari.connect_events(&media_request.app).await?;
-    let ari_drain = tokio::spawn(drain_ari_events(ari_events));
-    info!("event=ari_events_stream_established");
+    // Resolve SIP server address
+    let sip_server: SocketAddr = format!("{}:5060", cfg.telnyx_sip_domain)
+        .parse()
+        .or_else(|_| {
+            // Domain name — resolve via DNS
+            use std::net::ToSocketAddrs;
+            format!("{}:5060", cfg.telnyx_sip_domain)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "DNS resolution failed"))
+        })
+        .with_context(|| format!("failed to resolve SIP server: {}", cfg.telnyx_sip_domain))?;
+
+    info!(sip_server = %sip_server, "event=sip_server_resolved");
+
+    // Create SIP client and register with the trunk
+    let sip_bind_addr: SocketAddr = format!("{}:0", cfg.sip_local_addr)
+        .parse()
+        .context("invalid SIP_LOCAL_ADDR")?;
+
+    let sip = SipClient::new(
+        sip_bind_addr,
+        sip_server,
+        cfg.telnyx_sip_domain.clone(),
+        cfg.telnyx_sip_user.clone(),
+        cfg.telnyx_sip_pass.clone(),
+        cfg.caller_id.clone(),
+        cfg.caller_name.clone(),
+    )
+    .await?;
+
+    // REGISTER with Telnyx (handles 401 digest challenge)
+    info!("event=registering_sip");
+    sip.register().await?;
+    info!("event=sip_registered");
 
     // Signal to slmodemd that the audio path is ready.
     // 'R' = Ready. slmodemd blocks on socket_start() until it reads this byte.
     let mut sl_stream = sl_stream;
+    use tokio::io::AsyncWriteExt;
     sl_stream.writable().await?;
     sl_stream.write_all(b"R").await?;
     info!("event=sent_ready_to_slmodemd, reason=unblocks slmodemd modem emulation");
@@ -107,8 +139,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         let dial_string = match dial_string {
             Some(ds) => ds,
             None => {
-                info!("event=slmodemd_socket_closed, reason=normal shutdown, aborting ARI drain");
-                ari_drain.abort();
+                info!("event=slmodemd_socket_closed, reason=normal shutdown");
                 return Ok(());
             }
         };
@@ -128,29 +159,36 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         let mut session = Session::new(dial_string.clone());
         session.transition(SessionState::Originating)?;
 
-        // ARI setup with concurrent slmodemd drain.
-        //
-        // Why: slmodemd starts its DSP immediately after sending DIAL:. It
-        // writes modem tones to the socket and expects continuous received
-        // audio frames. Without draining, the socket buffer fills with stale
-        // audio that arrives as a burst when relay starts — corrupting modem
-        // training. Without silence feed, the DSP underruns and its internal
-        // timing drifts.
+        // Bind RTP socket
+        let rtp_bind: SocketAddr = format!("{}:{}", cfg.sip_local_addr, cfg.sip_local_rtp_port)
+            .parse()
+            .context("invalid RTP bind address")?;
+        let rtp_socket = tokio::net::UdpSocket::bind(rtp_bind)
+            .await
+            .with_context(|| format!("failed to bind RTP socket on {rtp_bind}"))?;
+        let rtp_local = rtp_socket.local_addr()?;
+        info!(rtp_local = %rtp_local, "event=rtp_socket_bound");
+
+        // Build SDP offer with our RTP address
+        let session_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let sdp_offer = sdp::build_offer(sip.local_ip(), rtp_local.port(), session_id);
+
+        // SIP INVITE with concurrent slmodemd drain
         let setup_result = {
-            let setup_fut = ari_setup(
-                &ari,
-                &cfg,
-                &media_request,
-                &dial_string,
-                &mut session,
-            );
-            drain_during_ari_setup(&mut read_half, &mut write_half, &silence, setup_fut).await
+            let invite_fut = sip.invite(&dial_string, &sdp_offer, cfg.invite_timeout);
+            drain_during_sip_setup(&mut read_half, &mut write_half, &silence, invite_fut).await
         };
 
-        let (media_ws, call) = match setup_result {
-            Ok(result) => result,
+        let call = match setup_result {
+            Ok(call) => {
+                session.transition(SessionState::ConnectingMedia)?;
+                call
+            }
             Err(err) => {
-                warn!(error = %err, dial = %dial_string, "event=ari_setup_failed, returning to wait state");
+                warn!(error = %err, dial = %dial_string, "event=sip_setup_failed, returning to wait state");
                 sl_stream = read_half
                     .reunite(write_half)
                     .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
@@ -158,22 +196,46 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
             }
         };
 
-        // Full bidirectional relay with slin↔ulaw codec conversion.
+        let remote_rtp = match call.remote_rtp {
+            Some(addr) => addr,
+            None => {
+                warn!(dial = %dial_string, "event=no_remote_rtp, reason=no SDP in INVITE response");
+                sip.bye(&call).await.ok();
+                sl_stream = read_half
+                    .reunite(write_half)
+                    .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
+                continue;
+            }
+        };
+
+        // Send ACK for 200 OK
+        if call.state == CallState::Answered {
+            sip.ack(&call).await?;
+        }
+
+        // Full bidirectional relay with slin↔ulaw codec conversion over RTP.
         session.transition(SessionState::MediaActive)?;
-        info!(dial = %session.dial(), state = ?session.state(), "event=bridge_start");
+        info!(
+            dial = %session.dial(),
+            state = ?session.state(),
+            remote_rtp = %remote_rtp,
+            "event=bridge_start"
+        );
         let started = tokio::time::Instant::now();
 
         let sl_stream_reunited = read_half
             .reunite(write_half)
             .map_err(|_| anyhow::anyhow!("failed to reunite socket halves for relay"))?;
 
-        match relay_media(sl_stream_reunited, media_ws).await {
-            Ok((sl_reunited, bytes_to_ws, bytes_to_sl)) => {
+        let (rtp_sender, rtp_receiver) = rtp::create_rtp_pair(rtp_socket, RTP_SSRC);
+
+        match relay_media(sl_stream_reunited, rtp_sender, rtp_receiver, remote_rtp).await {
+            Ok((sl_reunited, bytes_to_rtp, bytes_to_sl)) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 info!(
                     dial = %dial_string,
                     duration_ms = elapsed_ms,
-                    tx_bytes = bytes_to_ws,
+                    tx_bytes = bytes_to_rtp,
                     rx_bytes = bytes_to_sl,
                     "event=bridge_stop",
                 );
@@ -181,98 +243,29 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
             }
             Err(e) => {
                 error!(error = %e, dial = %dial_string, "event=media_relay_error");
-                ari.teardown(&call).await;
+                sip.bye(&call).await.ok();
                 return Err(e);
             }
         }
 
         info!(dial = %dial_string, "event=teardown_start");
-        ari.teardown(&call).await;
+        sip.bye(&call).await.ok();
         info!(dial = %dial_string, "event=teardown_complete");
         session.transition(SessionState::Terminating)?;
+        session.transition(SessionState::Terminated)?;
     }
 }
 
-/// Perform all ARI setup: create media channel, connect WebSocket, originate
-/// outbound call and bridge channels. Each step cleans up on failure.
-async fn ari_setup(
-    ari: &AriController,
-    cfg: &Config,
-    media_request: &ExternalMediaRequest,
-    dial_string: &str,
-    session: &mut Session,
-) -> Result<(
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    crate::ari_control::ActiveCall,
-)> {
-    let media_setup = match ari.setup_media(media_request).await {
-        Ok(setup) => {
-            info!(
-                bridge_id = %setup.bridge_id,
-                media_channel_id = %setup.media_channel_id,
-                "event=media_setup_complete"
-            );
-            setup
-        }
-        Err(err) => {
-            warn!(error = %err, dial = dial_string, "event=media_setup_failed");
-            return Err(err);
-        }
-    };
-    session.transition(SessionState::ConnectingMedia)?;
-
-    let media_ws = match ari
-        .connect_media_websocket(&media_setup.media_websocket_url, cfg.connect_timeout)
-        .await
-    {
-        Ok(ws) => {
-            info!(
-                url = %media_setup.media_websocket_url,
-                "event=media_websocket_connected"
-            );
-            ws
-        }
-        Err(err) => {
-            warn!(error = %err, "event=media_websocket_connect_failed");
-            ari.cleanup_media(&media_setup).await;
-            return Err(err);
-        }
-    };
-
-    let call = match ari
-        .dial_and_bridge(dial_string, &media_request.app, &media_setup)
-        .await
-    {
-        Ok(call) => {
-            info!(
-                outbound_channel_id = %call.outbound_channel_id,
-                bridge_id = %call.bridge_id,
-                "event=dial_and_bridge_complete"
-            );
-            call
-        }
-        Err(err) => {
-            warn!(error = %err, dial = dial_string, "event=dial_failed");
-            ari.cleanup_media(&media_setup).await;
-            return Err(err);
-        }
-    };
-
-    Ok((media_ws, call))
-}
-
-/// Drain slmodemd audio and feed silence while an async ARI setup runs.
+/// Drain slmodemd audio and feed silence while an async SIP setup runs.
 ///
 /// slmodemd starts its DSP immediately after sending DIAL:. It writes modem
 /// tones to the socket and expects continuous received audio frames (20 ms
-/// cadence). This function keeps the DSP alive during ARI HTTP calls by:
+/// cadence). This function keeps the DSP alive during SIP signaling by:
 /// 1. Reading and discarding audio from slmodemd (prevents kernel buffer
 ///    overflow and stale-audio burst when relay starts)
 /// 2. Writing silence frames every 20 ms (prevents DSP underrun and timing
 ///    drift that would corrupt modem training)
-async fn drain_during_ari_setup<F, T>(
+async fn drain_during_sip_setup<F, T>(
     read_half: &mut tokio::net::unix::OwnedReadHalf,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     silence: &[u8],
@@ -281,6 +274,8 @@ async fn drain_during_ari_setup<F, T>(
 where
     F: std::future::Future<Output = Result<T>>,
 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     assert!(
         silence.len() == SILENCE_FRAME_BYTES,
         "silence must be {SILENCE_FRAME_BYTES} bytes"
@@ -297,7 +292,7 @@ where
     loop {
         assert!(
             iterations < DRAIN_ITERATIONS_LIMIT,
-            "drain loop exceeded {DRAIN_ITERATIONS_LIMIT} iterations — ARI setup stuck"
+            "drain loop exceeded {DRAIN_ITERATIONS_LIMIT} iterations — SIP setup stuck"
         );
         iterations += 1;
 
@@ -316,7 +311,7 @@ where
                 match res {
                     Ok(0) => {
                         return Err(anyhow::anyhow!(
-                            "slmodemd closed socket during ARI setup"
+                            "slmodemd closed socket during SIP setup"
                         ));
                     }
                     Ok(n) => {
@@ -324,7 +319,7 @@ where
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!(
-                            "slmodemd read error during ARI setup: {e}"
+                            "slmodemd read error during SIP setup: {e}"
                         ));
                     }
                 }
@@ -332,7 +327,7 @@ where
             _ = silence_interval.tick() => {
                 if let Err(e) = write_half.write_all(silence).await {
                     return Err(anyhow::anyhow!(
-                        "failed to write silence during ARI setup: {e}"
+                        "failed to write silence during SIP setup: {e}"
                     ));
                 }
             }
@@ -349,6 +344,8 @@ async fn wait_for_dial_string(
     line_buf: &mut Vec<u8>,
     silence: &[u8],
 ) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     assert!(
         silence.len() == SILENCE_FRAME_BYTES,
         "silence buffer must be {SILENCE_FRAME_BYTES} bytes, got {}",
@@ -416,36 +413,34 @@ async fn wait_for_dial_string(
     }
 }
 
-/// Bidirectional media relay between slmodemd unix socket and Asterisk media
-/// WebSocket, with slin↔ulaw codec conversion.
+/// Bidirectional media relay between slmodemd unix socket and remote RTP
+/// endpoint, with slin↔ulaw codec conversion.
 ///
-/// slmodemd speaks signed 16-bit linear PCM (S16_LE, 8 kHz). Asterisk's
-/// ExternalMedia WebSocket is configured for ulaw (G.711 µ-law). Converting
-/// here lets Asterisk's bridge use proxy_media mode (true passthrough, no
-/// transcoding) which gives the cleanest audio path for modem training.
+/// slmodemd speaks signed 16-bit linear PCM (S16_LE, 8 kHz). The SIP/RTP
+/// endpoint uses ulaw (G.711 µ-law, payload type 0). Converting here gives
+/// the cleanest possible audio path — no transcoding middleman, direct UDP
+/// delivery with minimal latency.
 ///
 /// Returns the reunited unix stream and byte counts for each direction.
 async fn relay_media(
     sl_stream: tokio::net::UnixStream,
-    media_ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    mut rtp_sender: rtp::RtpSender,
+    rtp_receiver: rtp::RtpReceiver,
+    remote_rtp: SocketAddr,
 ) -> Result<(tokio::net::UnixStream, u64, u64)> {
-    let (mut ws_writer, mut ws_reader) = media_ws.split();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let (mut sl_reader, mut sl_writer) = sl_stream.into_split();
 
-    info!("event=relay_media_start");
+    info!(remote_rtp = %remote_rtp, "event=relay_media_start");
 
-    // sl→ws: read slin from slmodemd, convert to ulaw, send to Asterisk.
-    let sl_to_ws = async {
+    // sl→rtp: read slin from slmodemd, convert to ulaw, send as RTP.
+    let sl_to_rtp = async {
         let mut total: u64 = 0;
         let mut interval_bytes: u64 = 0;
         let mut frames: u64 = 0;
         let mut last_report = tokio::time::Instant::now();
         let mut buf = [0u8; 2048];
-        // Residual byte from a previous read that split mid-sample. In
-        // practice this never happens (slmodemd writes 320-byte frames),
-        // but we handle it for correctness.
         let mut residual: Option<u8> = None;
 
         loop {
@@ -454,8 +449,7 @@ async fn relay_media(
                 .await
                 .context("failed reading from slmodemd socket")?;
             if n == 0 {
-                debug!("event=sl_to_ws_eof, reason=slmodemd closed audio stream");
-                let _ = ws_writer.send(Message::Close(None)).await;
+                debug!("event=sl_to_rtp_eof, reason=slmodemd closed audio stream");
                 break;
             }
 
@@ -469,15 +463,14 @@ async fn relay_media(
             interval_bytes += ulaw.len() as u64;
             frames += 1;
 
-            ws_writer
-                .send(Message::Binary(ulaw.into()))
+            rtp_sender.send_packet(&ulaw, remote_rtp)
                 .await
-                .context("failed writing modem audio to media websocket")?;
+                .context("failed sending RTP packet")?;
 
             if last_report.elapsed() >= RELAY_STATS_INTERVAL {
                 let elapsed_ms = last_report.elapsed().as_millis();
                 info!(
-                    direction = "sl→ws",
+                    direction = "sl→rtp",
                     interval_bytes,
                     interval_frames = frames,
                     interval_ms = elapsed_ms,
@@ -492,8 +485,8 @@ async fn relay_media(
         Result::<u64>::Ok(total)
     };
 
-    // ws→sl: read ulaw from Asterisk, convert to slin, write to slmodemd.
-    let ws_to_sl = async {
+    // rtp→sl: receive RTP from remote, convert ulaw to slin, write to slmodemd.
+    let rtp_to_sl = async {
         let mut total: u64 = 0;
         let mut interval_bytes: u64 = 0;
         let mut frames: u64 = 0;
@@ -501,28 +494,26 @@ async fn relay_media(
         let mut max_frame: usize = 0;
         let mut last_report = tokio::time::Instant::now();
 
-        while let Some(frame) = ws_reader.next().await {
-            let frame = frame.context("failed reading from media websocket")?;
-            match frame {
-                Message::Binary(data) => {
-                    let len = data.len();
+        loop {
+            match rtp_receiver.recv_packet().await {
+                Ok(Some((payload, _addr))) => {
+                    let len = payload.len();
                     total += len as u64;
                     interval_bytes += len as u64;
                     frames += 1;
                     min_frame = min_frame.min(len);
                     max_frame = max_frame.max(len);
 
-                    // Convert ulaw from Asterisk to slin for slmodemd's DSP.
-                    let slin = codec::decode_ulaw(&data);
+                    let slin = codec::decode_ulaw(&payload);
                     sl_writer
                         .write_all(&slin)
                         .await
-                        .context("failed writing media audio to slmodemd socket")?;
+                        .context("failed writing RTP audio to slmodemd socket")?;
 
                     if last_report.elapsed() >= RELAY_STATS_INTERVAL {
                         let elapsed_ms = last_report.elapsed().as_millis();
                         info!(
-                            direction = "ws→sl",
+                            direction = "rtp→sl",
                             interval_bytes,
                             interval_frames = frames,
                             interval_ms = elapsed_ms,
@@ -538,34 +529,25 @@ async fn relay_media(
                         last_report = tokio::time::Instant::now();
                     }
                 }
-                Message::Close(reason) => {
-                    debug!(?reason, "event=ws_to_sl_close, reason=asterisk closed media websocket");
+                Ok(None) => {
+                    // Invalid RTP packet (wrong version, too short) — skip
+                    debug!("event=rtp_invalid_packet_skipped");
+                }
+                Err(e) => {
+                    // UDP recv error — likely socket closed
+                    debug!(error = %e, "event=rtp_recv_error");
                     break;
-                }
-                Message::Text(text) => {
-                    // Asterisk's WebSocket channel driver sends a MEDIA_START
-                    // text frame on connection with format, ptime, and
-                    // optimal frame size. Log it for diagnostics.
-                    if text.contains("MEDIA_START") {
-                        info!(media_start = %text, "event=media_start_received");
-                    } else {
-                        warn!(text = %text, "event=unexpected_text_frame_on_media_ws");
-                    }
-                }
-                Message::Ping(_) | Message::Pong(_) => {}
-                _ => {
-                    debug!("event=unknown_ws_frame_type");
                 }
             }
         }
         Result::<u64>::Ok(total)
     };
 
-    let (bytes_to_ws, bytes_to_sl) =
-        tokio::try_join!(sl_to_ws, ws_to_sl).context("media relay failed")?;
+    let (bytes_to_rtp, bytes_to_sl) =
+        tokio::try_join!(sl_to_rtp, rtp_to_sl).context("media relay failed")?;
 
     info!(
-        tx_bytes = bytes_to_ws,
+        tx_bytes = bytes_to_rtp,
         rx_bytes = bytes_to_sl,
         "event=relay_media_stop"
     );
@@ -574,61 +556,7 @@ async fn relay_media(
         .reunite(sl_writer)
         .map_err(|_| anyhow::anyhow!("failed to reunite sl_stream parts after relay"))?;
 
-    Ok((sl_reunited, bytes_to_ws, bytes_to_sl))
-}
-
-/// Drain the ARI events WebSocket to keep the Stasis app registered.
-/// This stream MUST stay open for the bridge's lifetime — dropping it
-/// unregisters the app and Asterisk will reject subsequent ARI calls.
-async fn drain_ari_events(
-    stream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) {
-    info!("event=ari_event_drain_start");
-    let (_writer, mut reader) = stream.split();
-
-    /// Upper bound on ARI events to drain before logging a summary. Prevents
-    /// unbounded silent consumption. 100k events at ~1/sec = ~28 hours; well
-    /// beyond any single bridge session.
-    const EVENTS_DRAIN_LOG_INTERVAL: u64 = 1000;
-    const EVENTS_DRAIN_LIMIT: u64 = 100_000;
-
-    let mut events_count: u64 = 0;
-
-    while let Some(msg) = reader.next().await {
-        events_count += 1;
-
-        if events_count % EVENTS_DRAIN_LOG_INTERVAL == 0 {
-            debug!(events_count, "event=ari_drain_heartbeat");
-        }
-
-        if events_count >= EVENTS_DRAIN_LIMIT {
-            warn!(
-                events_count,
-                limit = EVENTS_DRAIN_LIMIT,
-                "event=ari_drain_limit_reached, reason=exceeded event drain limit, stopping"
-            );
-            break;
-        }
-
-        match msg {
-            Ok(Message::Close(reason)) => {
-                info!(?reason, "event=ari_events_closed, reason=asterisk closed the events websocket");
-                break;
-            }
-            Ok(Message::Text(text)) => {
-                debug!(event_text = %text, "event=ari_event_received");
-            }
-            Err(err) => {
-                error!(error = %err, "event=ari_events_error, reason=events websocket read failed");
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    info!(events_count, "event=ari_event_drain_stop");
+    Ok((sl_reunited, bytes_to_rtp, bytes_to_sl))
 }
 
 #[cfg(test)]
@@ -650,7 +578,7 @@ mod tests {
     #[test]
     fn drain_iterations_limit_covers_setup_window() {
         // At 20ms per iteration, the limit should cover at least 5 seconds
-        // of ARI setup time.
+        // of SIP setup time.
         let coverage_ms = DRAIN_ITERATIONS_LIMIT as u64 * SILENCE_INTERVAL_MS;
         assert!(
             coverage_ms >= 5000,

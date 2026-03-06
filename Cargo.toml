@@ -1,20 +1,16 @@
 [package]
-name = "slmodem-asterisk-bridge"
-version = "0.1.15"
+name = "slmodem-sip-bridge"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Rust media bridge between slmodemd socket audio and Asterisk-managed call paths"
+description = "Rust media bridge between slmodemd socket audio and SIP/RTP call paths"
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+md5 = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-url = "2"
