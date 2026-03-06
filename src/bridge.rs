@@ -257,11 +257,15 @@ pub async fn run(cfg: Config) -> Result<()> {
 
             tokio::pin!(relay_fut);
             tokio::pin!(answer_poll_fut);
+            let mut answer_done = false;
             loop {
+                if answer_done {
+                    break relay_fut.await;
+                }
                 tokio::select! {
                     result = &mut relay_fut => break result,
                     _ = &mut answer_poll_fut => {
-                        // 200 OK handled, continue waiting for relay
+                        answer_done = true;
                     }
                 }
             }
