@@ -220,17 +220,39 @@ impl SipClient {
         self.send_msg(&auth_register).await?;
         info!("event=register_auth_sent");
 
-        let resp2 = self.recv_response_timeout(REGISTER_TIMEOUT).await?;
-        let status2 = parse_status_code(&resp2);
+        // Read responses, skipping stale retransmissions from CSeq 1.
+        let deadline = tokio::time::Instant::now() + REGISTER_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                bail!("authenticated REGISTER timed out");
+            }
 
-        if status2 == Some(200) {
-            info!("event=register_success");
-            Ok(())
-        } else {
-            bail!(
-                "authenticated REGISTER failed with status {}",
-                status2.unwrap_or(0)
-            );
+            let resp2 = match self.try_recv_response().await {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Skip retransmitted responses from the first REGISTER (CSeq 1)
+            if let Some(resp_cseq) = extract_cseq_num(&resp2) {
+                if resp_cseq != 2 {
+                    debug!(
+                        resp_cseq,
+                        "event=ignoring_stale_register_response, reason=CSeq mismatch"
+                    );
+                    continue;
+                }
+            }
+
+            let status2 = parse_status_code(&resp2);
+            if status2 == Some(200) {
+                info!("event=register_success");
+                return Ok(());
+            } else {
+                bail!(
+                    "authenticated REGISTER failed with status {}",
+                    status2.unwrap_or(0)
+                );
+            }
         }
     }
 
