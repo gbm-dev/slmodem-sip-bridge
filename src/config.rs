@@ -53,6 +53,14 @@ pub struct Cli {
 
     #[arg(
         long,
+        env = "TELNYX_OUTBOUND_CID",
+        default_value = "",
+        help = "Outbound caller ID number (your Telnyx DID). Required by most SIP providers."
+    )]
+    pub caller_id: String,
+
+    #[arg(
+        long,
         env = "ARI_ORIGINATE_TIMEOUT_SECS",
         default_value_t = 60u64,
         help = "Timeout waiting for outbound channel to reach Up state"
@@ -79,6 +87,7 @@ pub struct Config {
     pub ari_password: String,
     pub ari_dial_endpoint_template: String,
     pub originate_timeout: Duration,
+    pub caller_id: String,
 }
 
 impl From<Cli> for Config {
@@ -93,6 +102,7 @@ impl From<Cli> for Config {
             ari_password: cli.ari_password,
             ari_dial_endpoint_template: cli.ari_dial_endpoint_template,
             originate_timeout: Duration::from_secs(cli.originate_timeout_secs),
+            caller_id: cli.caller_id,
         }
     }
 }

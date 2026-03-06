@@ -31,6 +31,7 @@ pub struct AriController {
     password: String,
     dial_endpoint_template: String,
     originate_timeout: Duration,
+    caller_id: String,
 }
 
 impl AriController {
@@ -56,6 +57,7 @@ impl AriController {
             password: cfg.ari_password.clone(),
             dial_endpoint_template: cfg.ari_dial_endpoint_template.clone(),
             originate_timeout: cfg.originate_timeout,
+            caller_id: cfg.caller_id.clone(),
         })
     }
 
@@ -429,15 +431,20 @@ impl AriController {
         let endpoint = self.endpoint_from_dial(dial);
         let create_url = self.path_url("/channels/create")?;
 
+        let mut query: Vec<(&str, &str)> = vec![
+            ("endpoint", endpoint.as_str()),
+            ("app", app),
+            ("channelId", channel_id),
+            ("appArgs", dial),
+        ];
+        if !self.caller_id.is_empty() {
+            query.push(("callerId", self.caller_id.as_str()));
+        }
+
         self.client
             .post(create_url)
             .basic_auth(&self.username, Some(&self.password))
-            .query(&[
-                ("endpoint", endpoint.as_str()),
-                ("app", app),
-                ("channelId", channel_id),
-                ("appArgs", dial),
-            ])
+            .query(&query)
             .send()
             .await
             .context("failed to create outbound channel request")?
@@ -669,6 +676,7 @@ mod tests {
             ari_password: "p".to_string(),
             ari_dial_endpoint_template: "PJSIP/{dial}@telnyx-out".to_string(),
             originate_timeout: Duration::from_secs(60),
+            caller_id: "+15551234567".to_string(),
         }
     }
 

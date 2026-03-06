@@ -33,10 +33,15 @@ async fn main() -> Result<()> {
     let external_media = ExternalMediaRequest::from_env_defaults();
     let external_media_pairs = external_media.query_pairs();
 
+    if cfg.caller_id.is_empty() {
+        tracing::warn!("event=no_caller_id, reason=TELNYX_OUTBOUND_CID not set — outbound calls will likely get 403 from provider");
+    }
+
     tracing::info!(
         dial = %cfg.dial_string,
         media = %cfg.media_addr,
         fd = cfg.socket_fd,
+        caller_id = %cfg.caller_id,
         ari_base_url = %cfg.ari_base_url,
         ari_endpoint = ExternalMediaRequest::endpoint_path(),
         ari_transport = external_media.transport.as_str(),
