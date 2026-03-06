@@ -203,7 +203,7 @@ impl SipClient {
              Max-Forwards: 70\r\n\
              User-Agent: slmodem-sip-bridge\r\n\
              Authorization: Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", \
-             uri=\"sip:{domain}\", response=\"{response}\", algorithm=MD5\r\n\
+             uri=\"sip:{domain}\", response=\"{response}\", algorithm=MD5{opaque}\r\n\
              Content-Length: 0\r\n\
              \r\n",
             domain = self.sip_domain,
@@ -216,6 +216,7 @@ impl SipClient {
             realm = digest.realm,
             nonce = digest.nonce,
             response = response,
+            opaque = digest.opaque_param(),
         );
 
         self.send_msg(&auth_register).await?;
@@ -424,6 +425,7 @@ impl SipClient {
 
                     let auth_header = extract_header(&resp, auth_hdr_name)
                         .ok_or_else(|| anyhow::anyhow!("{status} missing {auth_hdr_name}"))?;
+                    debug!(challenge = %auth_header, status, "event=invite_auth_challenge");
                     let digest = parse_digest_challenge(&auth_header)?;
                     let response = compute_digest_response(
                         &self.username,
@@ -445,12 +447,13 @@ impl SipClient {
 
                     let auth_value = format!(
                         "Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", \
-                         uri=\"{uri}\", response=\"{resp}\", algorithm=MD5",
+                         uri=\"{uri}\", response=\"{resp}\", algorithm=MD5{opaque}",
                         user = self.username,
                         realm = digest.realm,
                         nonce = digest.nonce,
                         uri = invite_uri,
                         resp = response,
+                        opaque = digest.opaque_param(),
                     );
 
                     let auth_invite = self.build_invite(
@@ -663,6 +666,18 @@ impl SipClient {
 struct DigestChallenge {
     realm: String,
     nonce: String,
+    opaque: Option<String>,
+}
+
+impl DigestChallenge {
+    /// Format the opaque parameter for inclusion in an Authorization header.
+    /// Returns `, opaque="value"` if present, empty string otherwise.
+    fn opaque_param(&self) -> String {
+        match &self.opaque {
+            Some(v) => format!(", opaque=\"{v}\""),
+            None => String::new(),
+        }
+    }
 }
 
 fn parse_digest_challenge(header: &str) -> Result<DigestChallenge> {
@@ -670,7 +685,8 @@ fn parse_digest_challenge(header: &str) -> Result<DigestChallenge> {
         .ok_or_else(|| anyhow::anyhow!("digest challenge missing realm"))?;
     let nonce = extract_quoted_param(header, "nonce")
         .ok_or_else(|| anyhow::anyhow!("digest challenge missing nonce"))?;
-    Ok(DigestChallenge { realm, nonce })
+    let opaque = extract_quoted_param(header, "opaque");
+    Ok(DigestChallenge { realm, nonce, opaque })
 }
 
 /// Compute MD5 digest response per RFC 2617 §3.2.2.
