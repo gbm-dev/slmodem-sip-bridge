@@ -181,13 +181,12 @@ impl SipClient {
         debug!(www_authenticate = %auth_header, "event=register_401_challenge");
 
         let digest = parse_digest_challenge(&auth_header)?;
-        let response = compute_digest_response(
+        let register_uri = format!("sip:{}", self.sip_domain);
+        let auth_value = digest.auth_header_value(
             &self.username,
             &self.password,
-            &digest.realm,
-            &digest.nonce,
             "REGISTER",
-            &format!("sip:{}", self.sip_domain),
+            &register_uri,
         );
 
         let branch2 = generate_branch();
@@ -202,8 +201,7 @@ impl SipClient {
              Expires: 180\r\n\
              Max-Forwards: 70\r\n\
              User-Agent: slmodem-sip-bridge\r\n\
-             Authorization: Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", \
-             uri=\"sip:{domain}\", response=\"{response}\", algorithm=MD5{opaque}\r\n\
+             Authorization: {auth_value}\r\n\
              Content-Length: 0\r\n\
              \r\n",
             domain = self.sip_domain,
@@ -213,10 +211,6 @@ impl SipClient {
             branch = branch2,
             tag = tag,
             call_id = call_id,
-            realm = digest.realm,
-            nonce = digest.nonce,
-            response = response,
-            opaque = digest.opaque_param(),
         );
 
         self.send_msg(&auth_register).await?;
@@ -427,11 +421,9 @@ impl SipClient {
                         .ok_or_else(|| anyhow::anyhow!("{status} missing {auth_hdr_name}"))?;
                     debug!(challenge = %auth_header, status, "event=invite_auth_challenge");
                     let digest = parse_digest_challenge(&auth_header)?;
-                    let response = compute_digest_response(
+                    let auth_value = digest.auth_header_value(
                         &self.username,
                         &self.password,
-                        &digest.realm,
-                        &digest.nonce,
                         "INVITE",
                         &invite_uri,
                     );
@@ -444,17 +436,6 @@ impl SipClient {
                     call.cseq += 1;
                     let new_branch = generate_branch();
                     call.via_branch = new_branch.clone();
-
-                    let auth_value = format!(
-                        "Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", \
-                         uri=\"{uri}\", response=\"{resp}\", algorithm=MD5{opaque}",
-                        user = self.username,
-                        realm = digest.realm,
-                        nonce = digest.nonce,
-                        uri = invite_uri,
-                        resp = response,
-                        opaque = digest.opaque_param(),
-                    );
 
                     let auth_invite = self.build_invite(
                         &invite_uri,
@@ -667,18 +648,53 @@ struct DigestChallenge {
     realm: String,
     nonce: String,
     opaque: Option<String>,
+    qop: Option<String>,
 }
 
 impl DigestChallenge {
-    /// Format the opaque parameter for inclusion in an Authorization header.
-    /// Returns `, opaque="value"` if present, empty string otherwise.
-    fn opaque_param(&self) -> String {
-        match &self.opaque {
-            Some(v) => format!(", opaque=\"{v}\""),
-            None => String::new(),
+    /// Build the full Authorization header value for this challenge.
+    fn auth_header_value(
+        &self,
+        username: &str,
+        password: &str,
+        method: &str,
+        uri: &str,
+    ) -> String {
+        let digest_resp = compute_digest_response(
+            username,
+            password,
+            &self.realm,
+            &self.nonce,
+            method,
+            uri,
+            self.qop.as_deref(),
+        );
+
+        let mut header = format!(
+            "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+             uri=\"{uri}\", response=\"{resp}\", algorithm=MD5",
+            realm = self.realm,
+            nonce = self.nonce,
+            resp = digest_resp.response,
+        );
+
+        if let Some(ref opaque) = self.opaque {
+            header.push_str(&format!(", opaque=\"{opaque}\""));
         }
+
+        if self.qop.is_some() {
+            header.push_str(&format!(
+                ", qop=auth, nc={NC}, cnonce=\"{cnonce}\"",
+                cnonce = digest_resp.cnonce,
+            ));
+        }
+
+        header
     }
 }
+
+/// Nonce count — always 1 since we get a fresh nonce per challenge.
+const NC: &str = "00000001";
 
 fn parse_digest_challenge(header: &str) -> Result<DigestChallenge> {
     let realm = extract_quoted_param(header, "realm")
@@ -686,21 +702,53 @@ fn parse_digest_challenge(header: &str) -> Result<DigestChallenge> {
     let nonce = extract_quoted_param(header, "nonce")
         .ok_or_else(|| anyhow::anyhow!("digest challenge missing nonce"))?;
     let opaque = extract_quoted_param(header, "opaque");
-    Ok(DigestChallenge { realm, nonce, opaque })
+    let qop = extract_quoted_param(header, "qop");
+    Ok(DigestChallenge { realm, nonce, opaque, qop })
+}
+
+/// Result of a digest response computation, including cnonce when qop is used.
+#[derive(Debug)]
+struct DigestResponse {
+    response: String,
+    cnonce: String,
+}
+
+impl std::fmt::Display for DigestResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.response)
+    }
 }
 
 /// Compute MD5 digest response per RFC 2617 §3.2.2.
-pub fn compute_digest_response(
+/// When qop is Some("auth"), uses the extended formula with cnonce and nc.
+fn compute_digest_response(
     username: &str,
     password: &str,
     realm: &str,
     nonce: &str,
     method: &str,
     uri: &str,
-) -> String {
+    qop: Option<&str>,
+) -> DigestResponse {
     let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
     let ha2 = md5_hex(&format!("{method}:{uri}"));
-    md5_hex(&format!("{ha1}:{nonce}:{ha2}"))
+    let cnonce = generate_cnonce();
+    let response = match qop {
+        Some("auth") => {
+            md5_hex(&format!("{ha1}:{nonce}:{NC}:{cnonce}:auth:{ha2}"))
+        }
+        _ => md5_hex(&format!("{ha1}:{nonce}:{ha2}")),
+    };
+    DigestResponse { response, cnonce }
+}
+
+fn generate_cnonce() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}", md5::compute(ts.to_le_bytes()))
 }
 
 fn md5_hex(input: &str) -> String {
@@ -856,12 +904,13 @@ mod tests {
             "dcd98b7102dd2f0e8b11d0f600bfb0c093",
             "GET",
             "/dir/index.html",
+            None,
         );
         // Verify HA1 and HA2 individually to confirm algorithm structure
         let ha1 = format!("{:x}", md5::compute("Mufasa:testrealm@host.com:Circle Of Life"));
         let ha2 = format!("{:x}", md5::compute("GET:/dir/index.html"));
         let expected = format!("{:x}", md5::compute(format!("{ha1}:dcd98b7102dd2f0e8b11d0f600bfb0c093:{ha2}")));
-        assert_eq!(result, expected);
+        assert_eq!(result.response, expected);
     }
 
     #[test]
@@ -959,10 +1008,12 @@ mod tests {
 
     #[test]
     fn parse_digest_challenge_extracts_fields() {
-        let header = "Digest realm=\"telnyx.com\", nonce=\"aef321\", algorithm=MD5, qop=\"auth\"";
+        let header = "Digest realm=\"telnyx.com\", nonce=\"aef321\", algorithm=MD5, qop=\"auth\", opaque=\"abc/123\"";
         let digest = parse_digest_challenge(header).unwrap();
         assert_eq!(digest.realm, "telnyx.com");
         assert_eq!(digest.nonce, "aef321");
+        assert_eq!(digest.qop.as_deref(), Some("auth"));
+        assert_eq!(digest.opaque.as_deref(), Some("abc/123"));
     }
 
     #[test]
