@@ -314,8 +314,15 @@ async fn relay_media(
 
     info!("event=relay_media_start");
 
+    /// How often to log relay throughput stats. 2 seconds is frequent enough
+    /// to diagnose audio flow problems without flooding logs.
+    const RELAY_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
     let sl_to_ws = async {
         let mut total: u64 = 0;
+        let mut interval_bytes: u64 = 0;
+        let mut frames: u64 = 0;
+        let mut last_report = tokio::time::Instant::now();
         let mut buf = [0u8; 2048];
         loop {
             let n = sl_reader
@@ -328,33 +335,77 @@ async fn relay_media(
                 break;
             }
             total += n as u64;
+            interval_bytes += n as u64;
+            frames += 1;
             ws_writer
                 .send(Message::Binary(buf[..n].to_vec().into()))
                 .await
                 .context("failed writing modem audio to media websocket")?;
+
+            if last_report.elapsed() >= RELAY_STATS_INTERVAL {
+                let elapsed_ms = last_report.elapsed().as_millis();
+                info!(
+                    direction = "sl→ws",
+                    interval_bytes,
+                    interval_frames = frames,
+                    interval_ms = elapsed_ms,
+                    total_bytes = total,
+                    "event=relay_throughput"
+                );
+                interval_bytes = 0;
+                frames = 0;
+                last_report = tokio::time::Instant::now();
+            }
         }
         Result::<u64>::Ok(total)
     };
 
     let ws_to_sl = async {
         let mut total: u64 = 0;
+        let mut interval_bytes: u64 = 0;
+        let mut frames: u64 = 0;
+        let mut min_frame: usize = usize::MAX;
+        let mut max_frame: usize = 0;
+        let mut last_report = tokio::time::Instant::now();
         while let Some(frame) = ws_reader.next().await {
             let frame = frame.context("failed reading from media websocket")?;
             match frame {
                 Message::Binary(data) => {
-                    total += data.len() as u64;
+                    let len = data.len();
+                    total += len as u64;
+                    interval_bytes += len as u64;
+                    frames += 1;
+                    min_frame = min_frame.min(len);
+                    max_frame = max_frame.max(len);
                     sl_writer
                         .write_all(&data)
                         .await
                         .context("failed writing media audio to slmodemd socket")?;
+
+                    if last_report.elapsed() >= RELAY_STATS_INTERVAL {
+                        let elapsed_ms = last_report.elapsed().as_millis();
+                        info!(
+                            direction = "ws→sl",
+                            interval_bytes,
+                            interval_frames = frames,
+                            interval_ms = elapsed_ms,
+                            total_bytes = total,
+                            min_frame_bytes = min_frame,
+                            max_frame_bytes = max_frame,
+                            "event=relay_throughput"
+                        );
+                        interval_bytes = 0;
+                        frames = 0;
+                        min_frame = usize::MAX;
+                        max_frame = 0;
+                        last_report = tokio::time::Instant::now();
+                    }
                 }
                 Message::Close(reason) => {
                     debug!(?reason, "event=ws_to_sl_close, reason=asterisk closed media websocket");
                     break;
                 }
                 Message::Text(text) => {
-                    // Asterisk should not send text frames on the media WS.
-                    // Log it so we can diagnose unexpected protocol behavior.
                     warn!(text = %text, "event=unexpected_text_frame_on_media_ws");
                 }
                 Message::Ping(_) | Message::Pong(_) => {}
