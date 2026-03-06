@@ -316,18 +316,20 @@ impl AriController {
         self.dial_endpoint_template.replace("{dial}", dial)
     }
 
+    /// Build the media WebSocket URL from the connection ID.
+    /// The media WebSocket is served at /media/{id} on the HTTP server root,
+    /// NOT under the /ari REST prefix. We derive the host:port from the ARI
+    /// base URL but strip the path.
     fn media_websocket_url(&self, connection_id: &str) -> Result<String> {
-        let mut ws_url = self.path_url(&format!("/media/{connection_id}"))?;
-        let scheme = match ws_url.scheme() {
+        let scheme = match self.base_url.scheme() {
             "http" => "ws",
             "https" => "wss",
             s => bail!("unsupported ARI URL scheme for media websocket: {s}"),
         };
-        ws_url
-            .set_scheme(scheme)
-            .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
-        ws_url.set_query(None);
-        Ok(ws_url.to_string())
+        let host = self.base_url.host_str()
+            .ok_or_else(|| anyhow::anyhow!("ARI base URL has no host"))?;
+        let port = self.base_url.port().unwrap_or(8088);
+        Ok(format!("{scheme}://{host}:{port}/media/{connection_id}"))
     }
 
     /// Connect to the media WebSocket with authentication.
@@ -348,9 +350,10 @@ impl AriController {
         let ws_url = Url::parse(url)
             .with_context(|| format!("invalid media websocket URL: {url}"))?;
 
-        // Build request with explicit Basic Auth header, matching the
-        // approach used in connect_events(). connect_async does NOT
-        // extract userinfo from the URL into an Authorization header.
+        // Build request with explicit Basic Auth header and the required
+        // "media" subprotocol. Asterisk's chan_websocket registers a
+        // WebSocket handler with subprotocol "media" — without the
+        // Sec-WebSocket-Protocol header, the upgrade is rejected.
         let auth = format!("{}:{}", self.username, self.password);
         let auth_base64 = base64::engine::general_purpose::STANDARD.encode(auth);
         let auth_header = format!("Basic {auth_base64}");
@@ -361,6 +364,7 @@ impl AriController {
             .header("Host", ws_url.host_str().unwrap_or("localhost"))
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Protocol", "media")
             .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
             .header("Sec-WebSocket-Version", "13")
             .body(())?;
@@ -685,9 +689,11 @@ mod tests {
     }
 
     #[test]
-    fn builds_media_websocket_url_from_ari_base() {
+    fn builds_media_websocket_url_without_ari_prefix() {
+        // Media WebSocket is served at /media/{id} on the HTTP root,
+        // NOT under the /ari REST prefix.
         let ctl = AriController::from_config(&cfg()).unwrap();
         let url = ctl.media_websocket_url("media-conn-1").unwrap();
-        assert_eq!(url, "ws://127.0.0.1:8088/ari/media/media-conn-1");
+        assert_eq!(url, "ws://127.0.0.1:8088/media/media-conn-1");
     }
 }
