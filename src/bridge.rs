@@ -182,7 +182,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             drain_during_sip_setup(&mut read_half, &mut write_half, &silence, invite_fut).await
         };
 
-        let call = match setup_result {
+        let mut call = match setup_result {
             Ok(call) => {
                 session.transition(SessionState::ConnectingMedia)?;
                 call
@@ -208,7 +208,8 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         };
 
-        // Send ACK for 200 OK
+        // Send ACK for 200 OK (immediate answer) or poll for it during
+        // the media relay (early media / ringing).
         if call.state == CallState::Answered {
             sip.ack(&call).await?;
         }
@@ -229,7 +230,44 @@ pub async fn run(cfg: Config) -> Result<()> {
 
         let (rtp_sender, rtp_receiver) = rtp::create_rtp_pair(rtp_socket, RTP_SSRC);
 
-        match relay_media(sl_stream_reunited, rtp_sender, rtp_receiver, remote_rtp).await {
+        // Run media relay, concurrently polling for 200 OK if in early media.
+        // The block ensures the answer_poll future (which borrows &mut call)
+        // is dropped before we use call for teardown.
+        let relay_result = {
+            let answer_poll_fut = async {
+                if call.state == CallState::EarlyMedia {
+                    let mut poll_interval =
+                        tokio::time::interval(std::time::Duration::from_millis(50));
+                    loop {
+                        poll_interval.tick().await;
+                        match sip.poll_answer(&mut call).await {
+                            Ok(true) => break,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(error = %e, "event=answer_poll_error");
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+
+            let relay_fut =
+                relay_media(sl_stream_reunited, rtp_sender, rtp_receiver, remote_rtp);
+
+            tokio::pin!(relay_fut);
+            tokio::pin!(answer_poll_fut);
+            loop {
+                tokio::select! {
+                    result = &mut relay_fut => break result,
+                    _ = &mut answer_poll_fut => {
+                        // 200 OK handled, continue waiting for relay
+                    }
+                }
+            }
+        };
+
+        match relay_result {
             Ok((sl_reunited, bytes_to_rtp, bytes_to_sl)) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 info!(

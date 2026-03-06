@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Maximum SIP message size. RFC 3261 §18.1.1 says implementations MUST
 /// handle messages up to the path MTU, and SHOULD handle up to 65535 bytes.
@@ -383,6 +383,10 @@ impl SipClient {
                                 remote_rtp = %rtp_addr,
                                 "event=early_media, reason=remote SDP received in provisional"
                             );
+                            // Return immediately — we have everything needed to
+                            // start relaying audio. The 200 OK and ACK are
+                            // handled by wait_for_answer() during the relay.
+                            return Ok(call);
                         }
                     } else {
                         debug!(status, "event=provisional_no_sdp");
@@ -467,6 +471,58 @@ impl SipClient {
                 }
             }
         }
+    }
+
+    /// Poll for 200 OK on a call in EarlyMedia state. Returns true when
+    /// answered (ACK is sent automatically), false if nothing yet.
+    /// Non-blocking: returns immediately if no SIP response is available.
+    pub async fn poll_answer(&self, call: &mut Call) -> Result<bool> {
+        assert!(
+            call.state == CallState::EarlyMedia,
+            "poll_answer called in wrong state: {:?}",
+            call.state
+        );
+
+        let resp = match self.try_recv_response().await {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+
+        let status = match parse_status_code(&resp) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        // Ignore retransmitted provisionals
+        if status >= 100 && status < 200 {
+            return Ok(false);
+        }
+
+        if status == 200 {
+            // Update remote RTP if 200 OK carries SDP (may differ from 183)
+            if let Some(sdp) = extract_sdp_body(&resp) {
+                if let Ok(answer) = crate::sdp::parse_answer(&sdp) {
+                    let rtp_addr = SocketAddr::new(answer.addr, answer.port);
+                    call.remote_rtp = Some(rtp_addr);
+                }
+            }
+            // Extract remote tag if not yet set
+            if call.remote_tag.is_none() {
+                if let Some(to) = extract_header(&resp, "To") {
+                    if let Some(tag) = extract_tag_param(&to) {
+                        call.remote_tag = Some(tag);
+                    }
+                }
+            }
+            call.state = CallState::Answered;
+            info!("event=invite_200_ok");
+            self.ack(call).await?;
+            return Ok(true);
+        }
+
+        // Any non-2xx final response during early media means call failed
+        warn!(status, "event=call_failed_during_early_media");
+        bail!("call failed with status {status} during early media");
     }
 
     /// Send ACK for a 200 OK response (or error response).
