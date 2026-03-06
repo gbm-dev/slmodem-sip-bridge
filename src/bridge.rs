@@ -1,6 +1,7 @@
 use crate::ari_control::AriController;
 use crate::ari_external_media::ExternalMediaRequest;
 use crate::config::Config;
+use crate::dial_string::DialString;
 use crate::session::{Session, SessionState};
 use crate::slmodem::socket_from_raw_fd;
 use anyhow::{Context, Result};
@@ -102,6 +103,19 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         };
 
         calls_count += 1;
+        // slmodemd sends the raw ATDT string including the T/P prefix
+        // (e.g. "T17186945647"). Strip it so the SIP endpoint gets a
+        // clean phone number, not "PJSIP/T17186945647@telnyx-out".
+        let dial_string = match DialString::parse(&dial_string) {
+            Ok(parsed) => parsed.as_str().to_string(),
+            Err(err) => {
+                warn!(error = %err, raw = %dial_string, "event=invalid_dial_string");
+                sl_stream = read_half
+                    .reunite(write_half)
+                    .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
+                continue;
+            }
+        };
         info!(dial = %dial_string, calls_count, "event=received_dial_string");
         let mut session = Session::new(dial_string.clone());
         session.transition(SessionState::Originating)?;
